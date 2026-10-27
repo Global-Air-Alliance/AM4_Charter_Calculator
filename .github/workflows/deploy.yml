@@ -1,0 +1,127 @@
+# Deployt den Ordner site/tools/charter_calculator/ per rsync über SSH auf den Webserver (lima-city),
+# Ziel: www/tools/charter_calculator/ (die Seite dazu kommt aus dem Repository Global-Air-Alliance/website).
+# Läuft automatisch bei jedem Push auf main, der etwas in site/ ändert,
+# oder manuell unter Actions → "Deploy Charter Calculator" → "Run workflow" (dort mit Probelauf).
+# Nach erfolgreichem Push-Deployment wird jeder Commit als Nachricht in den/die Discord-Forenpost(s) (DISCORD_THREAD_ID) gemeldet.
+# Schlägt ein Schritt fehl, geht eine Mail an MAIL_RECIPIENT.
+#
+# Benötigte Variablen (Settings → Secrets and variables → Actions → Tab Variablen):
+#   DEPLOY_KNOWN_HOSTS  Ausgabe von: ssh-keyscan -p <port> <host>  (gleich wie beim Repository website)
+#   DEPLOY_HOST         SSH-Host laut lima-city (gleich wie beim Repository website)
+#   DEPLOY_USER         SSH-Benutzer laut lima-city (gleich wie beim Repository website)
+#   DEPLOY_PATH         gleicher Wert wie beim Repository website (Ordner www/ aus Sicht des Schlüssels).
+#                       Der Unterordner tools/charter_calculator ist unten fest eingetragen (TARGET) und wird
+#                       immer angehängt – der Workflow kann daher nie direkt in www/ schreiben oder löschen.
+#   DEPLOY_PORT         optional, Standard 22
+#   DISCORD_THREAD_ID   ID des Discord-Forenposts; mehrere IDs mit Komma trennen (Meldung in jeden Post)
+#   DISCORD_LABEL       optional: Text vor jeder Discord-Meldung, z. B. "✈️ Charter Calculator"
+#   MAIL_SERVER         SMTP-Server
+#   MAIL_USER           SMTP-Benutzername
+#   MAIL_FROM           Absenderadresse (wenn leer, wird MAIL_USER verwendet)
+#   MAIL_PORT           optional, Standard 465 (SSL); bei 587 wird STARTTLS verwendet
+#   MAIL_RECIPIENT      Empfänger (wenn leer: admin@globalairall.net)
+# Benötigte Secrets (Settings → Secrets and variables → Actions → Tab Secrets):
+#   DEPLOY_KEY          privater SSH-Schlüssel, derselbe wie beim Repository website (serverseitig per rrsync auf www/ beschränkt)
+#   DISCORD_WEBHOOK     Webhook-URL des Discord-Forenkanals (ohne ?thread_id)
+#   MAIL_PASSWORD       Passwort des Absender-Postfachs
+
+name: Deploy Charter Calculator
+run-name: Deploy Charter Calculator – ${{ github.event_name == 'push' && github.event.head_commit.message || 'manuell' }}
+
+on:
+  push:
+    branches: [main]
+    paths: ['site/**']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Nur Probelauf (zeigt, was geändert würde, ohne etwas zu übertragen)'
+        type: boolean
+        default: true
+
+concurrency: deploy-charter-calculator
+
+env:
+  SRC: site/tools/charter_calculator
+  # Fester Zielordner unterhalb von www/ – nicht ändern
+  TARGET: tools/charter_calculator
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Quelle und Ziel prüfen
+        env:
+          BASE: ${{ vars.DEPLOY_PATH }}
+        run: |
+          # Schutz vor --delete mit leerem Quellordner
+          test -n "$(ls -A "$SRC" 2>/dev/null)" || { echo "::error::$SRC fehlt oder ist leer"; exit 1; }
+          # Ziel muss genau tools/<tool> unterhalb von www/ sein
+          case "$TARGET" in
+            tools/route_calculator|tools/hubplanner|tools/charter_calculator|tools/shared_resources) ;;
+            *) echo "::error::Unzulässiges Ziel '$TARGET'"; exit 1 ;;
+          esac
+          case "$BASE" in
+            *..*) echo "::error::DEPLOY_PATH darf kein '..' enthalten"; exit 1 ;;
+          esac
+          DEST="${BASE:-.}"; DEST="${DEST%/}/$TARGET"
+          echo "Ziel: $DEST"
+          echo "DEST=$DEST" >> "$GITHUB_ENV"
+
+      - name: SSH einrichten
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${{ vars.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Dateien übertragen
+        env:
+          DRY: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          # -c: Vergleich per Prüfsumme, damit nur wirklich geänderte Dateien übertragen und gemeldet werden
+          rsync -rlvzc --delete $DRY \
+            --exclude '.htaccess' --exclude '.well-known/' \
+            -e "ssh -i ~/.ssh/deploy_key -p ${{ vars.DEPLOY_PORT || '22' }} -o StrictHostKeyChecking=yes" \
+            "$SRC/" "${{ vars.DEPLOY_USER }}@${{ vars.DEPLOY_HOST }}:$DEST/"
+
+      - name: Commits an Discord melden
+        if: success() && github.event_name == 'push' && vars.DISCORD_THREAD_ID != ''
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          THREAD_IDS: ${{ vars.DISCORD_THREAD_ID }}
+          LABEL: ${{ vars.DISCORD_LABEL }}
+          COMMITS: ${{ toJson(github.event.commits) }}
+        run: |
+          for THREAD_ID in $(echo "$THREAD_IDS" | tr ',' ' '); do
+            echo "$COMMITS" | jq -c '.[]' | while read -r c; do
+              jq -n --argjson c "$c" --arg label "$LABEL" '{content: (
+                  (if $label != "" then $label + " · " else "" end)
+                  + "**" + ($c.message | split("\n")[0]) + "**\n"
+                  + ($c.message | split("\n")[1:] | join("\n") | ltrimstr("\n"))
+                  + "\n👤 " + $c.author.name + " · [" + $c.id[0:7] + "](" + $c.url + ") · ✅ live"
+                )[0:2000]}' \
+                | curl -fsS -H "Content-Type: application/json" -d @- "$WEBHOOK?thread_id=$THREAD_ID"
+              sleep 1
+            done
+          done
+
+      - name: Fehler per Mail melden
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ vars.MAIL_SERVER }}
+          server_port: ${{ vars.MAIL_PORT || '465' }}
+          secure: ${{ (vars.MAIL_PORT || '465') == '465' }}
+          username: ${{ vars.MAIL_USER }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          from: GitHub Deploy <${{ vars.MAIL_FROM || vars.MAIL_USER }}>
+          to: ${{ vars.MAIL_RECIPIENT || 'admin@globalairall.net' }}
+          subject: "❌ Deploy fehlgeschlagen: ${{ github.repository }}"
+          body: |
+            Der Workflow "${{ github.workflow }}" ist fehlgeschlagen.
+            Ausgelöst von: ${{ github.actor }}
+            Commit: ${{ github.sha }}
+            Details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
